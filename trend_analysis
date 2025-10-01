@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""
+sneaker_trends_analysis.py
+Single-file feature that:
+ - uses pytrends to fetch Google Trends for sneaker keywords
+ - uses PRAW (Reddit) for social mentions
+ - ranks items by trend slope and mention velocity
+Requirements:
+ pip install pytrends praw pandas numpy scipy python-dateutil
+Set environment variables:
+ REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT
+Notes:
+ - pytrends is an unofficial API; it can break if Google changes endpoints.
+ - Reddit Pushshift access has changed; this script uses PRAW (official API).
+"""
+
+import os
+import sys
+import time
+import math
+import argparse
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+from dateutil import parser as dateparser
+from scipy.stats import linregress
+
+# pytrends
+from pytrends.request import TrendReq
+
+# reddit (PRAW)
+import praw
+
+# ---------- Config ----------
+KEYWORDS = [
+    # example brand/models — you can change/add
+    "Nike Air Jordan 1",
+    "Nike Dunk Low",
+    "Adidas Yeezy Boost 350",
+    "Air Jordan 4",
+    "New Balance 550",
+    "Converse Chuck Taylor"
+]
+
+# optionally include size tokens to detect mentions like "size 9" (basic heuristic)
+SIZE_TOKENS = ["size", "sz", "us", "uk", "eu"]
+
+# pytrends settings
+PYTRENDS_LANG = "en-US"
+PYTRENDS_TZ = 360  # timezone offset in minutes (e.g. 360 for UTC+6) - not critical
+
+# analysis windows
+TRENDS_DAYS = 90     # how many days of Google Trends history to fetch
+REDDIT_DAYS = 14     # how many days of Reddit activity to consider
+REDDIT_LIMIT = 300   # number of search results to request per keyword
+
+OUTPUT_CSV = "sneaker_trends_ranking.csv"
+
+# ---------- Helper functions ----------
+
+def init_pytrends():
+    # no auth needed for pytrends; it's an unofficial wrapper
+    return TrendReq(hl=PYTRENDS_LANG, tz=PYTRENDS_TZ, retries=3, backoff=2.0)
+
+def fetch_trends(pytrends, keyword, days=TRENDS_DAYS):
+    # timeframe format: 'YYYY-MM-DD YYYY-MM-DD' or 'today 3-m'
+    end = datetime.utcnow().date()
+    start = end - timedelta(days=days)
+    timeframe = f"{start.isoformat()} {end.isoformat()}"
+    try:
+        pytrends.build_payload([keyword], cat=0, timeframe=timeframe, geo="", gprop="")
+        df = pytrends.interest_over_time()
+        if df.empty:
+            return None
+        # drop isPartial column if present
+        if "isPartial" in df.columns:
+            df = df.drop(columns=["isPartial"])
+        df = df.rename(columns={keyword: "interest"})
+        df.index = pd.to_datetime(df.index)
+        return df[["interest"]]
+    except Exception as e:
+        print(f"[pytrends] error for '{keyword}': {e}", file=sys.stderr)
+        return None
+
+def slope_of_series(series):
+    # compute linear slope (trend) of the series values vs time (days)
+    if len(series) < 3:
+        return 0.0
+    x = np.arange(len(series))
+    y = np.array(series, dtype=float)
+    slope, intercept, r, p, se = linregress(x, y)
+    return float(slope)
+
+def init_reddit():
+    client_id = os.environ.get("REDDIT_CLIENT_ID")
+    client_secret = os.environ.get("REDDIT_CLIENT_SECRET")
+    user_agent = os.environ.get("REDDIT_USER_AGENT", "sneaker-trends-script")
+    if not client_id or not client_secret:
+        raise RuntimeError("REDITT credentials missing. Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET env vars.")
+    reddit = praw.Reddit(client_id=client_id,
+                         client_secret=client_secret,
+                         user_agent=user_agent,
+                         check_for_async=False)
+    return reddit
+
+def reddit_count_mentions(reddit, keyword, days=REDDIT_DAYS, limit=REDDIT_LIMIT):
+    """
+    Use Reddit search (PRAW) to count posts and comments mentioning the keyword
+    in the past `days`. Note: PRAW's search has limitations; for robust historical
+    search use Pushshift (subject to its access rules).
+    """
+    since = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+    q = f'"{keyword}"'
+    post_count = 0
+    comment_count = 0
+    mentions = []
+
+    # Search submissions (subreddit=None => sitewide)
+    try:
+        for submission in reddit.subreddit('all').search(q, sort='new', time_filter='all', limit=limit):
+            created = int(submission.created_utc)
+            if created < since:
+                continue
+            post_count += 1
+            mentions.append(dict(type="submission", id=submission.id, created_utc=created, title=submission.title, score=submission.score))
+    except Exception as e:
+        print(f"[reddit] submissions search error for '{keyword}': {e}", file=sys.stderr)
+
+    # Search comments using subreddit.search doesn't return comments; we'll use comment_stream as a fallback
+    # PRAW doesn't provide wide text search for comments easily; doing subreddit.search for 'keyword' in comments requires Pushshift.
+    # As a best-effort, check top submissions fetched above for comments containing keyword (limited).
+    try:
+        for m in mentions[:100]:  # check comments in first 100 matched submissions
+            try:
+                sub = reddit.submission(id=m['id'])
+                sub.comments.replace_more(limit=0)
+                for c in sub.comments.list():
+                    if keyword.lower() in (c.body or "").lower():
+                        created = int(c.created_utc)
+                        if created >= since:
+                            comment_count += 1
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[reddit] comment scan error: {e}", file=sys.stderr)
+
+    total = post_count + comment_count
+    # velocity = mentions per day
+    velocity = total / max(1.0, days)
+    return {"posts": post_count, "comments": comment_count, "total": total, "velocity_per_day": velocity}
+
+def extract_sizes_from_text(text):
+    """
+    Basic heuristic to find mentions like 'size 9', 'sz 9', 'US 9', '9 US', etc.
+    Not perfect — for production consider NLP rules and locale handling.
+    """
+    text_lower = text.lower()
+    tokens = text_lower.replace(",", " ").split()
+    found = []
+    for i, t in enumerate(tokens):
+        if t in ("size", "sz", "us", "uk", "eu"):
+            # look ahead for a number token
+            if i+1 < len(tokens):
+                nxt = tokens[i+1]
+                try:
+                    val = float(nxt)
+                    found.append(int(val))
+                except Exception:
+                    pass
+        else:
+            # standalone numbers that look like sizes (6 to 15)
+            try:
+                val = float(t)
+                iv = int(val)
+                if 4 <= iv <= 16:
+                    found.append(iv)
+            except Exception:
+                pass
+    return list(set(found))
+
+# ---------- Main analysis ----------
+
+def analyze(keywords=KEYWORDS):
+    pytrends = init_pytrends()
+    # reddit may fail if env not set; capture info
+    reddit = None
+    try:
+        reddit = init_reddit()
+    except Exception as e:
+        print(f"[warning] Reddit disabled: {e}", file=sys.stderr)
+
+    results = []
+
+    for kw in keywords:
+        print(f"\n[+] Analyzing keyword: {kw}")
+        trend_df = fetch_trends(pytrends, kw, days=TRENDS_DAYS)
+        if trend_df is None or trend_df.empty:
+            print(f"  - No trends data for '{kw}' (may be low volume or pytrends issue).")
+            slope = 0.0
+            recent_avg = 0.0
+        else:
+            # compute slope on recent 30-day window if available
+            window = min(30, len(trend_df))
+            recent = trend_df['interest'].iloc[-window:].values
+            slope = slope_of_series(recent)
+            recent_avg = float(np.mean(recent))
+
+            print(f"  - Trends points: {len(trend_df)} days; recent avg={recent_avg:.1f}; slope={slope:.4f}")
+
+        reddit_stats = {"posts":0,"comments":0,"total":0,"velocity_per_day":0.0}
+        if reddit:
+            try:
+                reddit_stats = reddit_count_mentions(reddit, kw, days=REDDIT_DAYS, limit=REDDIT_LIMIT)
+                print(f"  - Reddit mentions (last {REDDIT_DAYS}d): posts={reddit_stats['posts']}, comments≈{reddit_stats['comments']}, total={reddit_stats['total']}, velocity/day={reddit_stats['velocity_per_day']:.2f}")
+            except Exception as e:
+                print(f"  - Reddit fetch failed for '{kw}': {e}", file=sys.stderr)
+
+        # Heuristic "score": weighted sum of normalized slope and reddit velocity
+        # Normalize by simple scalers to keep magnitude reasonable
+        score = slope * 10.0 + reddit_stats['velocity_per_day'] * 2.0 + recent_avg * 0.1
+
+        results.append({
+            "keyword": kw,
+            "trend_slope": slope,
+            "trend_recent_avg": recent_avg,
+            "reddit_posts": reddit_stats['posts'],
+            "reddit_comments": reddit_stats['comments'],
+            "reddit_total": reddit_stats['total'],
+            "reddit_velocity_per_day": reddit_stats['velocity_per_day'],
+            "score": score
+        })
+
+        # polite pause to avoid rate limits
+        time.sleep(1.2)
+
+    df = pd.DataFrame(results)
+    df = df.sort_values("score", ascending=False).reset_index(drop=True)
+    df.index += 1
+    df.to_csv(OUTPUT_CSV, index_label="rank")
+    print(f"\nResults written to {OUTPUT_CSV}")
+    print("\nTop ranked items:")
+    print(df.head(10).to_string(index=True))
+
+    return df
+
+# ---------- CLI ----------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Sneaker Trends Analysis (pytrends + reddit)")
+    parser.add_argument("--keywords", "-k", nargs="+", help="Custom keywords (overrides defaults)")
+    parser.add_argument("--out", "-o", help="CSV output filename", default=OUTPUT_CSV)
+    args = parser.parse_args()
+
+    if args.keywords:
+        KEYWORDS = args.keywords
+
+    OUTPUT_CSV = args.out
+
+    try:
+        df = analyze(KEYWORDS)
+    except Exception as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)
