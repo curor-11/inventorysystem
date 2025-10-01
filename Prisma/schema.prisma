@@ -1,0 +1,58 @@
+generator client {
+model Image {
+id String @id @default(cuid())
+url String
+sneakerId String
+sneaker Sneaker @relation(fields: [sneakerId], references: [id])
+}
+
+model SKU {
+id String @id @default(cuid())
+sneakerId String
+skuCode String @unique
+size String
+color String
+barcode String?
+price Float
+sneaker Sneaker @relation(fields: [sneakerId], references: [id])
+inventories Inventory[]
+}
+
+model Warehouse {
+id String @id @default(cuid())
+name String
+address String?
+inventories Inventory[]
+}
+
+model Inventory {
+id String @id @default(cuid())
+skuId String
+warehouseId String
+quantity Int @default(0)
+reserved Int @default(0)
+updatedAt DateTime @updatedAt
+
+sku SKU @relation(fields: [skuId], references: [id])
+warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+
+@@unique([skuId, warehouseId])
+}
+
+model StockAdjustment {
+id String @id @default(cuid())
+skuId String
+warehouseId String
+change Int
+reason String?
+createdById String?
+createdAt DateTime @default(now())
+}
+
+model AuditLog {
+id String @id @default(cuid())
+entity String
+action String
+details Json
+createdAt DateTime @default(now())
+}
